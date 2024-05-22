@@ -1,9 +1,4 @@
-"""
-Retriever model for Pinecone
-Author: Dhar Rawal (@drawal1)
-"""
-
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import backoff
 
@@ -11,14 +6,12 @@ import dspy
 from dsp.utils import dotdict
 
 try:
-    import pinecone
+    from pinecone import Pinecone, PodSpec, ServerlessSpec
+    from pinecone.data import Index
 except ImportError:
-    pinecone = None
-
-if pinecone is None:
     raise ImportError(
         "The pinecone library is required to use PineconeRM. Install it with `pip install dspy-ai[pinecone]`",
-    )
+    ) from None
 
 import openai
 
@@ -29,9 +22,11 @@ except Exception:
 
 try:
     import openai.error
+
     ERRORS = (openai.error.RateLimitError, openai.error.ServiceUnavailableError, openai.error.APIError)
 except Exception:
     ERRORS = (openai.RateLimitError, openai.APIError)
+
 
 class PineconeRM(dspy.Retrieve):
     """
@@ -65,15 +60,18 @@ class PineconeRM(dspy.Retrieve):
         ```python
         self.retrieve = PineconeRM(k=num_passages)
         ```
-    """
+    """  # noqa: D212
 
     def __init__(
         self,
         pinecone_index_name: str,
         pinecone_api_key: Optional[str] = None,
         pinecone_env: Optional[str] = None,
+        pinecone_region: Optional[str] = None,
+        pinecone_cloud: Optional[str] = None,
         local_embed_model: Optional[str] = None,
         openai_embed_model: Optional[str] = "text-embedding-ada-002",
+        openai_embedding_dimensions: Optional[int] = 1536,
         openai_api_key: Optional[str] = None,
         openai_org: Optional[str] = None,
         k: int = 3,
@@ -84,19 +82,18 @@ class PineconeRM(dspy.Retrieve):
                 from transformers import AutoModel, AutoTokenizer
             except ImportError as exc:
                 raise ModuleNotFoundError(
-                "You need to install Hugging Face transformers library to use a local embedding model with PineconeRM.",
-            ) from exc
+                    "You need to install Hugging Face transformers library to use a local embedding model with PineconeRM.",
+                ) from exc
 
             self._local_embed_model = AutoModel.from_pretrained(local_embed_model)
             self._local_tokenizer = AutoTokenizer.from_pretrained(local_embed_model)
             self.use_local_model = True
             self.device = torch.device(
-                'cuda:0' if torch.cuda.is_available() else
-                'mps' if torch.backends.mps.is_available()
-                else 'cpu',
+                "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
             )
         elif openai_embed_model is not None:
             self._openai_embed_model = openai_embed_model
+            self._openai_embedding_dimensions = openai_embedding_dimensions
             self.use_local_model = False
             # If not provided, defaults to env vars OPENAI_API_KEY and OPENAI_ORGANIZATION
             if openai_api_key:
@@ -109,7 +106,11 @@ class PineconeRM(dspy.Retrieve):
             )
 
         self._pinecone_index = self._init_pinecone(
-            pinecone_index_name, pinecone_api_key, pinecone_env,
+            pinecone_index_name,
+            pinecone_api_key,
+            pinecone_env,
+            pinecone_cloud,
+            pinecone_region,
         )
 
         super().__init__(k=k)
@@ -119,15 +120,19 @@ class PineconeRM(dspy.Retrieve):
         index_name: str,
         api_key: Optional[str] = None,
         environment: Optional[str] = None,
+        cloud: Optional[str] = None,
+        region: Optional[str] = None,
         dimension: Optional[int] = None,
         distance_metric: Optional[str] = None,
-    ) -> pinecone.Index:
+    ) -> Index:
         """Initialize pinecone and return the loaded index.
 
         Args:
             index_name (str): The name of the index to load. If the index is not does not exist, it will be created.
             api_key (str, optional): The Pinecone API key, defaults to env var PINECONE_API_KEY if not provided.
             environment (str, optional): The environment (ie. `us-west1-gcp` or `gcp-starter`. Defaults to env PINECONE_ENVIRONMENT.
+            cloud (str, optional): The cloud provider for Pinecone's ServerlessSpec (ie. `aws` or `gcp.
+            region (str, optional): The region for Pinecone's ServerlessSpec (ie. `us-west1` or `us-east1`.
 
         Raises:
             ValueError: If api_key or environment is not provided and not set as an environment variable.
@@ -136,34 +141,48 @@ class PineconeRM(dspy.Retrieve):
             pinecone.Index: The loaded index.
         """
 
-        # Pinecone init overrides default if kwargs are present, so we need to exclude if None
+        # Pinecone init ov errides default if kwargs are present, so we need to exclude if None
         kwargs = {}
         if api_key:
             kwargs["api_key"] = api_key
-        if environment:
-            kwargs["environment"] = environment
-        pinecone.init(**kwargs)
 
-        active_indexes = pinecone.list_indexes()
+        pc = Pinecone(**kwargs)
+
+        active_indexes = pc.list_indexes().names()
         if index_name not in active_indexes:
             if dimension is None and distance_metric is None:
                 raise ValueError(
                     "dimension and distance_metric must be provided since the index provided does not exist.",
                 )
+            if environment is not None:
+                pc.create_index(
+                    name=index_name,
+                    dimension=dimension,
+                    metric=distance_metric,
+                    spec=PodSpec(
+                        environment=environment,
+                    ),
+                )
+            elif cloud is not None and region is not None:
+                pc.create_index(
+                    name=index_name,
+                    dimension=dimension,
+                    metric=distance_metric,
+                    spec=ServerlessSpec(
+                        cloud=cloud,
+                        region=region,
+                    ),
+                )
+            else:
+                raise ValueError("either provide cloud and region or environment, since index provided does not exist")
 
-            pinecone.create_index(
-                name=index_name,
-                dimension=dimension,
-                metric=distance_metric,
-            )
+        return pc.Index(index_name)
 
-        return pinecone.Index(index_name)
-    
     def _mean_pooling(
-            self, 
-            model_output, 
-            attention_mask,
-        ):
+        self,
+        model_output,
+        attention_mask,
+    ):
         try:
             import torch
         except ImportError as exc:
@@ -171,85 +190,87 @@ class PineconeRM(dspy.Retrieve):
                 "You need to install torch to use a local embedding model with PineconeRM.",
             ) from exc
 
-        token_embeddings = model_output[0] # First element of model_output contains all token embeddings
+        token_embeddings = model_output[0]  # First element of model_output contains all token embeddings
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
- 
+
     @backoff.on_exception(
         backoff.expo,
         ERRORS,
         max_time=15,
     )
     def _get_embeddings(
-        self, 
-        queries: List[str],
-    ) -> List[List[float]]:
+        self,
+        queries: list[str],
+    ) -> list[list[float]]:
         """Return query vector after creating embedding using OpenAI
 
         Args:
-            queries (list): List of query strings to embed.
+            queries (list): list of query strings to embed.
 
         Returns:
-            List[List[float]]: List of embeddings corresponding to each query.
+            list[list[float]]: list of embeddings corresponding to each query.
         """
+        if not self.use_local_model:
+            if OPENAI_LEGACY:
+                embedding = openai.Embedding.create(input=queries, model=self._openai_embed_model)
+            else:
+                embedding = openai.embeddings.create(
+                    input=queries,
+                    model=self._openai_embed_model,
+                    dimensions=self._openai_embedding_dimensions,
+                ).model_dump()
+            return [embedding["embedding"] for embedding in embedding["data"]]
+
         try:
             import torch
         except ImportError as exc:
             raise ModuleNotFoundError(
                 "You need to install torch to use a local embedding model with PineconeRM.",
             ) from exc
-        
-        if not self.use_local_model:
-            if OPENAI_LEGACY:
-                embedding = openai.Embedding.create(
-                    input=queries, model=self._openai_embed_model,
-                )
-            else:
-                embedding = openai.embeddings.create(
-                    input=queries, model=self._openai_embed_model,
-                ).model_dump()
-            return [embedding["embedding"] for embedding in embedding["data"]]
-        
+
         # Use local model
-        encoded_input = self._local_tokenizer(queries, padding=True, truncation=True, return_tensors="pt").to(self.device)
+        encoded_input = self._local_tokenizer(queries, padding=True, truncation=True, return_tensors="pt").to(
+            self.device,
+        )
         with torch.no_grad():
             model_output = self._local_embed_model(**encoded_input.to(self.device))
 
-        embeddings = self._mean_pooling(model_output, encoded_input['attention_mask'])
+        embeddings = self._mean_pooling(model_output, encoded_input["attention_mask"])
         normalized_embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         return normalized_embeddings.cpu().numpy().tolist()
 
         # we need a pooling strategy to get a single vector representation of the input
         # so the default is to take the mean of the hidden states
 
-    def forward(self, query_or_queries: Union[str, List[str]]) -> dspy.Prediction:
+    def forward(self, query_or_queries: Union[str, list[str]], k: Optional[int] = None) -> dspy.Prediction:
         """Search with pinecone for self.k top passages for query
 
         Args:
-            query_or_queries (Union[str, List[str]]): The query or queries to search for.
+            query_or_queries (Union[str, list[str]]): The query or queries to search for.
 
         Returns:
             dspy.Prediction: An object containing the retrieved passages.
         """
-        queries = (
-            [query_or_queries]
-            if isinstance(query_or_queries, str)
-            else query_or_queries
-        )
+        queries = [query_or_queries] if isinstance(query_or_queries, str) else query_or_queries
         queries = [q for q in queries if q]  # Filter empty queries
         embeddings = self._get_embeddings(queries)
 
         # For single query, just look up the top k passages
         if len(queries) == 1:
             results_dict = self._pinecone_index.query(
-                embeddings[0], top_k=self.k, include_metadata=True,
+                vector=embeddings[0],
+                top_k=k or self.k,
+                include_metadata=True,
             )
 
             # Sort results by score
             sorted_results = sorted(
-                results_dict["matches"], key=lambda x: x.get("scores", 0.0), reverse=True,
+                results_dict["matches"],
+                key=lambda x: x.get("scores", 0.0),
+                reverse=True,
             )
-            passages = [result["metadata"]["text"] for result in sorted_results]
+            passages = [result["metadata"] for result in sorted_results]
             passages = [dotdict({"long_text": passage for passage in passages})]
             return dspy.Prediction(passages=passages)
 
@@ -258,15 +279,18 @@ class PineconeRM(dspy.Retrieve):
         passage_scores = {}
         for embedding in embeddings:
             results_dict = self._pinecone_index.query(
-                embedding, top_k=self.k * 3, include_metadata=True,
+                vector=embedding,
+                top_k=k or self.k * 3,
+                include_metadata=True,
             )
             for result in results_dict["matches"]:
                 passage_scores[result["metadata"]["text"]] = (
-                    passage_scores.get(result["metadata"]["text"], 0.0)
-                    + result["score"]
+                    passage_scores.get(result["metadata"]["text"], 0.0) + result["score"]
                 )
 
         sorted_passages = sorted(
-            passage_scores.items(), key=lambda x: x[1], reverse=True,
-        )[: self.k]
+            passage_scores.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )[: k or self.k]
         return dspy.Prediction(passages=[dotdict({"long_text": passage}) for passage, _ in sorted_passages])
